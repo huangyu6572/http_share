@@ -1,136 +1,233 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, scrolledtext
 import http.server
-import socketserver
 import threading
 import socket
 import os
 import urllib.parse
+import urllib.request
 import webbrowser
+import re
+import shutil
 from datetime import datetime
+from html.parser import HTMLParser
 
-class ShareServer(http.server.SimpleHTTPRequestHandler):
-    def __init__(self, *args, **kwargs):
-        # We'll set directory dynamically in the instance or use default
-        super().__init__(*args, **kwargs)
 
-    def log_message(self, format, *args):
-        pass
+# ─── 工具函数 ───────────────────────────────────────────────
+def get_local_ip():
+    """获取本机局域网 IP"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
 
-class HttpShareApp:
-    def __init__(self, root):
+
+def format_size(size_bytes):
+    """把字节数格式化为人类可读的大小"""
+    if size_bytes is None or size_bytes < 0:
+        return "-"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size_bytes < 1024:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f} PB"
+
+
+# ─── HTTP 目录列表解析器 ─────────────────────────────────────
+class DirectoryListParser(HTMLParser):
+    """解析 Python SimpleHTTPServer 生成的目录列表 HTML，提取链接名称"""
+
+    def __init__(self):
+        super().__init__()
+        self.links = []  # [(href, display_text)]
+        self._in_a = False
+        self._href = ""
+        self._text = ""
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self._in_a = True
+            self._text = ""
+            for name, value in attrs:
+                if name == "href":
+                    self._href = value
+
+    def handle_data(self, data):
+        if self._in_a:
+            self._text += data
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._in_a:
+            self._in_a = False
+            href = self._href
+            text = self._text.strip()
+            # 跳过 ../ 上级目录链接
+            if text and href and text != ".." and href.rstrip("/") != "..":
+                self.links.append((href, text))
+
+
+def fetch_file_list(base_url):
+    """从远程 HTTP 服务器获取文件列表，返回 [(name, is_dir, size_str, modified_str), ...]"""
+    if not base_url.endswith("/"):
+        base_url += "/"
+
+    req = urllib.request.Request(base_url)
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        html = resp.read().decode("utf-8", errors="replace")
+
+    parser = DirectoryListParser()
+    parser.feed(html)
+
+    items = []
+    for href, display_text in parser.links:
+        is_dir = href.endswith("/")
+        name = urllib.parse.unquote(href).rstrip("/")
+        if not name or name == "..":
+            continue
+
+        # 尝试通过 HEAD 请求获取文件大小和修改时间
+        size_str = "-"
+        modified_str = "-"
+        try:
+            full_url = urllib.parse.urljoin(base_url, href)
+            head_req = urllib.request.Request(full_url, method="HEAD")
+            with urllib.request.urlopen(head_req, timeout=5) as head_resp:
+                cl = head_resp.getheader("Content-Length")
+                if cl and not is_dir:
+                    size_str = format_size(int(cl))
+                lm = head_resp.getheader("Last-Modified")
+                if lm:
+                    modified_str = lm
+        except Exception:
+            pass
+
+        items.append((name, is_dir, size_str, modified_str))
+
+    return items
+
+
+def download_file(url, dest_path, progress_callback=None):
+    """下载单个文件到 dest_path，支持进度回调"""
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        total = resp.getheader("Content-Length")
+        total = int(total) if total else None
+        downloaded = 0
+        with open(dest_path, "wb") as f:
+            while True:
+                chunk = resp.read(8192)
+                if not chunk:
+                    break
+                f.write(chunk)
+                downloaded += len(chunk)
+                if progress_callback and total:
+                    progress_callback(downloaded, total)
+
+
+def download_directory(base_url, dest_dir, progress_callback=None):
+    """递归下载整个远程目录到本地 dest_dir"""
+    if not base_url.endswith("/"):
+        base_url += "/"
+    os.makedirs(dest_dir, exist_ok=True)
+
+    items = fetch_file_list(base_url)
+    for name, is_dir, _, _ in items:
+        item_url = urllib.parse.urljoin(base_url, urllib.parse.quote(name) + ("/" if is_dir else ""))
+        local_path = os.path.join(dest_dir, name)
+        if is_dir:
+            download_directory(item_url, local_path, progress_callback)
+        else:
+            download_file(item_url, local_path, progress_callback)
+            if progress_callback:
+                progress_callback(-1, -1)  # 信号：一个文件完成
+
+
+def fetch_text_content(url, max_bytes=1024 * 512):
+    """获取远程文本文件内容（最多读 512KB）"""
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = resp.read(max_bytes)
+    return data.decode("utf-8", errors="replace")
+
+
+# ─── 分享页 Tab ─────────────────────────────────────────────
+class ShareTab:
+    """原有的"文件分享"功能，封装到一个 Tab 中"""
+
+    def __init__(self, parent_frame, root):
         self.root = root
-        self.root.title("🚀 极简秒传 - 局域网分享")
-        self.root.geometry("600x750")  # 再次稍微增加高度
-        self.root.minsize(550, 700)
-        self.root.configure(bg="#f5f5f7")
-        
         self.share_path = ""
         self.is_dir = False
         self.server_thread = None
         self.httpd = None
         self.port = 8080
-        self.whitelist = set()  # 存储白名单 IP
-        self.whitelist_enabled = tk.BooleanVar(value=False) # 默认关闭
+        self.whitelist = set()
+        self.whitelist_enabled = tk.BooleanVar(value=False)
 
-        # 设置 DPI 自适应，防止在高分屏下模糊
-        try:
-            from ctypes import windll
-            windll.shcore.SetProcessDpiAwareness(1)
-        except:
-            pass
+        self.setup_ui(parent_frame)
 
-        self.style = ttk.Style()
-        self.style.theme_use('clam')
-        
-        # 自定义样式
-        self.style.configure("TButton", font=("Microsoft YaHei", 10), padding=10)
-        self.style.configure("Main.TLabel", background="#f5f5f7", font=("Microsoft YaHei", 12))
-        self.style.configure("Path.TLabel", background="#ffffff", font=("Microsoft YaHei", 9), relief="flat")
-        
-        self.setup_ui()
-
-    def setup_ui(self):
-        # 主容器
-        main_frame = tk.Frame(self.root, bg="#f5f5f7", padx=30, pady=20) # 减小垂直内边距
+    def setup_ui(self, parent):
+        main_frame = tk.Frame(parent, bg="#f5f5f7", padx=30, pady=15)
         main_frame.pack(expand=True, fill="both")
 
         # 标题
-        title_label = tk.Label(main_frame, text="快速共享文件", font=("Microsoft YaHei", 20, "bold"), bg="#f5f5f7", fg="#1d1d1f")
-        title_label.pack(pady=(0, 10))
-        
-        desc_label = tk.Label(main_frame, text="选择一个文件或目录，局域网内的设备即可访问", font=("Microsoft YaHei", 10), bg="#f5f5f7", fg="#86868b")
-        desc_label.pack(pady=(0, 20)) # 减小间距
+        tk.Label(main_frame, text="快速共享文件", font=("Microsoft YaHei", 18, "bold"),
+                 bg="#f5f5f7", fg="#1d1d1f").pack(pady=(0, 5))
+        tk.Label(main_frame, text="选择一个文件或目录，局域网内的设备即可访问",
+                 font=("Microsoft YaHei", 9), bg="#f5f5f7", fg="#86868b").pack(pady=(0, 15))
 
         # 按钮区
         btn_frame = tk.Frame(main_frame, bg="#f5f5f7")
-        btn_frame.pack(pady=10)
+        btn_frame.pack(pady=5)
+        ttk.Button(btn_frame, text="📄 选择文件", command=self.select_file, width=15).pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text="📁 选择文件夹", command=self.select_folder, width=15).pack(side=tk.LEFT, padx=10)
 
-        self.file_btn = ttk.Button(btn_frame, text="📄 选择文件", command=self.select_file, width=15)
-        self.file_btn.pack(side=tk.LEFT, padx=10)
-
-        self.dir_btn = ttk.Button(btn_frame, text="📁 选择文件夹", command=self.select_folder, width=15)
-        self.dir_btn.pack(side=tk.LEFT, padx=10)
-
-        # 路径展示区 (带圆角感官的 Frame)
-        path_container = tk.Frame(main_frame, bg="#ffffff", highlightthickness=1, highlightbackground="#d2d2d7", padx=10, pady=10)
-        path_container.pack(fill="x", pady=15) # 减小间距
-        
-        self.path_label = tk.Label(path_container, text="等待选择内容...", font=("Microsoft YaHei", 9), bg="#ffffff", fg="#6e6e73", wraplength=480)
+        # 路径展示区
+        path_container = tk.Frame(main_frame, bg="#ffffff", highlightthickness=1,
+                                  highlightbackground="#d2d2d7", padx=10, pady=8)
+        path_container.pack(fill="x", pady=10)
+        self.path_label = tk.Label(path_container, text="等待选择内容...",
+                                   font=("Microsoft YaHei", 9), bg="#ffffff", fg="#6e6e73", wraplength=480)
         self.path_label.pack()
 
-        # 白名单控制区
-        whitelist_frame = tk.Frame(main_frame, bg="#f5f5f7")
-        whitelist_frame.pack(fill="x", pady=10)
-        
-        ttk.Checkbutton(whitelist_frame, text="开启白名单模式 (仅允许指定IP访问)", variable=self.whitelist_enabled, command=self.on_whitelist_toggle).pack(side=tk.LEFT)
-        
-        self.ip_entry = ttk.Entry(whitelist_frame, width=15)
-        self.ip_entry.pack(side=tk.LEFT, padx=(20, 5))
+        # 白名单
+        wl_frame = tk.Frame(main_frame, bg="#f5f5f7")
+        wl_frame.pack(fill="x", pady=5)
+        ttk.Checkbutton(wl_frame, text="开启白名单 (仅允许指定IP)",
+                        variable=self.whitelist_enabled, command=self.on_whitelist_toggle).pack(side=tk.LEFT)
+        self.ip_entry = ttk.Entry(wl_frame, width=15)
+        self.ip_entry.pack(side=tk.LEFT, padx=(15, 5))
         self.ip_entry.insert(0, "192.168.1.100")
-        
-        ttk.Button(whitelist_frame, text="添加IP", command=self.add_to_whitelist, width=8).pack(side=tk.LEFT)
+        ttk.Button(wl_frame, text="添加", command=self.add_to_whitelist, width=6).pack(side=tk.LEFT)
 
-        # 链接展示区
-        link_frame = tk.Frame(main_frame, bg="#f5f5f7")
-        link_frame.pack(fill="x", pady=5)
-        
-        tk.Label(link_frame, text="共享链接:", font=("Microsoft YaHei", 10, "bold"), bg="#f5f5f7").pack(side=tk.LEFT)
-        
-        self.link_text = tk.Entry(main_frame, font=("Consolas", 11), bd=0, highlightthickness=1, highlightbackground="#d2d2d7", justify='center')
-        self.link_text.pack(fill="x", pady=5, ipady=8) # 减小间距
-        
-        # 操作区
+        # 链接
+        tk.Label(main_frame, text="共享链接:", font=("Microsoft YaHei", 10, "bold"),
+                 bg="#f5f5f7").pack(anchor=tk.W, pady=(10, 0))
+        self.link_text = tk.Entry(main_frame, font=("Consolas", 11), bd=0,
+                                  highlightthickness=1, highlightbackground="#d2d2d7", justify="center")
+        self.link_text.pack(fill="x", pady=5, ipady=6)
+
         action_frame = tk.Frame(main_frame, bg="#f5f5f7")
-        action_frame.pack(pady=10)
-
+        action_frame.pack(pady=5)
         self.copy_btn = ttk.Button(action_frame, text="📋 复制链接", command=self.copy_link, state=tk.DISABLED)
         self.copy_btn.pack(side=tk.LEFT, padx=5)
-
         self.open_btn = ttk.Button(action_frame, text="🌐 浏览器打开", command=self.open_in_browser, state=tk.DISABLED)
         self.open_btn.pack(side=tk.LEFT, padx=5)
 
-        # 日志输出区
-        tk.Label(main_frame, text="访问日志:", font=("Microsoft YaHei", 10, "bold"), bg="#f5f5f7").pack(anchor=tk.W, pady=(20, 5))
-        self.log_area = scrolledtext.ScrolledText(main_frame, height=10, font=("Consolas", 9), bg="#ffffff", bd=0, highlightthickness=1, highlightbackground="#d2d2d7")
+        # 日志
+        tk.Label(main_frame, text="访问日志:", font=("Microsoft YaHei", 10, "bold"),
+                 bg="#f5f5f7").pack(anchor=tk.W, pady=(10, 3))
+        self.log_area = scrolledtext.ScrolledText(main_frame, height=8, font=("Consolas", 9),
+                                                  bg="#ffffff", bd=0, highlightthickness=1,
+                                                  highlightbackground="#d2d2d7")
         self.log_area.pack(fill="both", expand=True)
         self.log_area.config(state=tk.DISABLED)
 
-        # 状态栏
-        self.status_var = tk.StringVar(value="准备就绪")
-        status_bar = tk.Label(self.root, textvariable=self.status_var, bd=0, bg="#e8e8ed", fg="#424245", font=("Microsoft YaHei", 8), anchor=tk.W, padx=10, pady=5)
-        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
-
-    def get_local_ip(self):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except Exception:
-            return "127.0.0.1"
-
+    # ── 业务逻辑 ──
     def select_file(self):
         path = filedialog.askopenfilename()
         if path:
@@ -149,40 +246,37 @@ class HttpShareApp:
 
     def on_whitelist_toggle(self):
         status = "开启" if self.whitelist_enabled.get() else "关闭"
-        self.log_to_ui(f"系统消息: 白名单模式已{status}")
+        self.log(f"系统消息: 白名单模式已{status}")
         if self.whitelist_enabled.get() and not self.whitelist:
-            self.log_to_ui("警告: 已开启白名单但名单为空，任何人都无法访问！")
+            self.log("警告: 已开启白名单但名单为空，任何人都无法访问！")
 
     def add_to_whitelist(self):
         ip = self.ip_entry.get().strip()
         if ip:
             self.whitelist.add(ip)
-            self.log_to_ui(f"系统消息: 已添加 {ip} 到白名单")
+            self.log(f"系统消息: 已添加 {ip} 到白名单")
             self.ip_entry.delete(0, tk.END)
         else:
             messagebox.showwarning("提示", "请输入有效的 IP 地址")
 
-    def log_to_ui(self, message):
-        """线程安全地在 UI 中打印日志"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        formatted_msg = f"[{timestamp}] {message}\n"
-        
-        def update():
+    def log(self, message):
+        ts = datetime.now().strftime("%H:%M:%S")
+        msg = f"[{ts}] {message}\n"
+
+        def _update():
             self.log_area.config(state=tk.NORMAL)
-            self.log_area.insert(tk.END, formatted_msg)
+            self.log_area.insert(tk.END, msg)
             self.log_area.see(tk.END)
             self.log_area.config(state=tk.DISABLED)
-        
-        self.root.after(0, update)
+
+        self.root.after(0, _update)
 
     def start_server(self):
         if self.httpd:
             self.httpd.shutdown()
             self.httpd.server_close()
 
-        local_ip = self.get_local_ip()
-        
-        # Determine the base URL
+        local_ip = get_local_ip()
         if self.is_dir:
             share_url = f"http://{local_ip}:{self.port}/"
             dir_to_serve = self.share_path
@@ -195,42 +289,37 @@ class HttpShareApp:
         self.copy_btn.config(state=tk.NORMAL)
         self.open_btn.config(state=tk.NORMAL)
 
+        tab = self
+
         def run_server():
-            # Using ThreadingHTTPServer to handle multiple concurrent connections
             from http.server import ThreadingHTTPServer
-            
-            app_instance = self
 
-            class LocalizedHandler(http.server.SimpleHTTPRequestHandler):
-                def do_GET(self):
-                    # 访问控制校验
-                    if app_instance.whitelist_enabled.get():
-                        client_ip = self.client_address[0]
-                        if client_ip not in app_instance.whitelist:
-                            app_instance.log_to_ui(f"拦截访问: 来自 {client_ip} 的请求被拒绝 (不在白名单)")
-                            self.send_error(403, "Access Denied: You are not on the whitelist.")
+            class Handler(http.server.SimpleHTTPRequestHandler):
+                def do_GET(self_h):
+                    if tab.whitelist_enabled.get():
+                        cip = self_h.client_address[0]
+                        if cip not in tab.whitelist:
+                            tab.log(f"拦截: {cip} 被拒绝 (不在白名单)")
+                            self_h.send_error(403, "Access Denied")
                             return
-                    
-                    super().do_GET()
+                    super(Handler, self_h).do_GET()
 
-                def __init__(self, *args, **kwargs):
-                    super().__init__(*args, directory=dir_to_serve, **kwargs)
-                
-                def log_message(self, format, *args):
-                    # 捕获访问请求并发送到 UI
-                    client_ip = self.client_address[0]
-                    request_info = args[0] if len(args) > 0 else "Unknown Request"
-                    status_code = args[1] if len(args) > 1 else "---"
-                    app_instance.log_to_ui(f"{client_ip} - {request_info} [{status_code}]")
+                def __init__(self_h, *a, **kw):
+                    super().__init__(*a, directory=dir_to_serve, **kw)
+
+                def log_message(self_h, fmt, *args):
+                    cip = self_h.client_address[0]
+                    req = args[0] if args else ""
+                    code = args[1] if len(args) > 1 else "---"
+                    tab.log(f"{cip} - {req} [{code}]")
 
             try:
-                with ThreadingHTTPServer(("", self.port), LocalizedHandler) as httpd:
+                with ThreadingHTTPServer(("", self.port), Handler) as httpd:
                     self.httpd = httpd
-                    name = os.path.basename(self.share_path)
-                    self.status_var.set(f"● 正在分享: {name} (多连接支持已开启)")
+                    tab.log(f"服务已启动 → {share_url}")
                     httpd.serve_forever()
             except Exception as e:
-                self.status_var.set(f"错误: {e}")
+                tab.log(f"错误: {e}")
 
         self.server_thread = threading.Thread(target=run_server, daemon=True)
         self.server_thread.start()
@@ -242,6 +331,276 @@ class HttpShareApp:
 
     def open_in_browser(self):
         webbrowser.open(self.link_text.get())
+
+
+# ─── 下载页 Tab ─────────────────────────────────────────────
+TEXT_EXTENSIONS = {
+    ".txt", ".py", ".js", ".ts", ".html", ".css", ".json", ".xml",
+    ".md", ".csv", ".log", ".ini", ".cfg", ".yaml", ".yml", ".toml",
+    ".sh", ".bat", ".cmd", ".c", ".h", ".cpp", ".java", ".go", ".rs",
+    ".rb", ".php", ".sql", ".conf", ".env", ".gitignore", ".properties",
+}
+
+
+class DownloadTab:
+    """新增的"下载文件"功能 Tab"""
+
+    def __init__(self, parent_frame, root):
+        self.root = root
+        self.current_url = ""          # 当前正在浏览的 URL
+        self.history = []              # URL 导航历史
+        self.download_dir = ""         # 下载保存目录
+        self.setup_ui(parent_frame)
+
+    def setup_ui(self, parent):
+        main = tk.Frame(parent, bg="#f5f5f7", padx=20, pady=15)
+        main.pack(expand=True, fill="both")
+
+        # 标题
+        tk.Label(main, text="远程文件浏览与下载", font=("Microsoft YaHei", 18, "bold"),
+                 bg="#f5f5f7", fg="#1d1d1f").pack(pady=(0, 5))
+        tk.Label(main, text="输入共享链接，浏览并下载文件",
+                 font=("Microsoft YaHei", 9), bg="#f5f5f7", fg="#86868b").pack(pady=(0, 10))
+
+        # 地址栏
+        addr_frame = tk.Frame(main, bg="#f5f5f7")
+        addr_frame.pack(fill="x", pady=5)
+        tk.Label(addr_frame, text="地址:", font=("Microsoft YaHei", 10), bg="#f5f5f7").pack(side=tk.LEFT)
+        self.url_entry = ttk.Entry(addr_frame, font=("Consolas", 10))
+        self.url_entry.pack(side=tk.LEFT, fill="x", expand=True, padx=5, ipady=4)
+        self.url_entry.insert(0, "http://192.168.1.5:8080/")
+        self.url_entry.bind("<Return>", lambda e: self.go())
+        ttk.Button(addr_frame, text="访问", command=self.go, width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Button(addr_frame, text="⬆ 上级", command=self.go_up, width=6).pack(side=tk.LEFT, padx=2)
+
+        # 下载目录选择
+        save_frame = tk.Frame(main, bg="#f5f5f7")
+        save_frame.pack(fill="x", pady=5)
+        tk.Label(save_frame, text="保存到:", font=("Microsoft YaHei", 10), bg="#f5f5f7").pack(side=tk.LEFT)
+        self.save_label = tk.Label(save_frame, text="(请先选择保存目录)",
+                                   font=("Microsoft YaHei", 9), bg="#f5f5f7", fg="#86868b")
+        self.save_label.pack(side=tk.LEFT, padx=5)
+        ttk.Button(save_frame, text="选择目录", command=self.choose_save_dir, width=10).pack(side=tk.RIGHT)
+
+        # 文件列表 Treeview
+        cols = ("name", "type", "size", "modified")
+        self.tree = ttk.Treeview(main, columns=cols, show="headings", height=12)
+        self.tree.heading("name", text="名称", anchor=tk.W)
+        self.tree.heading("type", text="类型", anchor=tk.CENTER)
+        self.tree.heading("size", text="大小", anchor=tk.E)
+        self.tree.heading("modified", text="修改时间", anchor=tk.W)
+        self.tree.column("name", width=250, anchor=tk.W)
+        self.tree.column("type", width=60, anchor=tk.CENTER)
+        self.tree.column("size", width=80, anchor=tk.E)
+        self.tree.column("modified", width=180, anchor=tk.W)
+        self.tree.pack(fill="both", expand=True, pady=5)
+        self.tree.bind("<Double-1>", self.on_double_click)
+
+        # 右键菜单
+        self.ctx_menu = tk.Menu(self.tree, tearoff=0)
+        self.ctx_menu.add_command(label="📥 下载", command=self.download_selected)
+        self.ctx_menu.add_command(label="👁 在线预览", command=self.preview_selected)
+        self.tree.bind("<Button-3>", self.show_context_menu)
+
+        # 操作栏
+        op_frame = tk.Frame(main, bg="#f5f5f7")
+        op_frame.pack(fill="x", pady=5)
+        ttk.Button(op_frame, text="📥 下载选中项", command=self.download_selected).pack(side=tk.LEFT, padx=5)
+        ttk.Button(op_frame, text="👁 在线预览", command=self.preview_selected).pack(side=tk.LEFT, padx=5)
+
+        # 状态 / 进度
+        self.dl_status_var = tk.StringVar(value="就绪")
+        tk.Label(main, textvariable=self.dl_status_var, font=("Microsoft YaHei", 8),
+                 bg="#f5f5f7", fg="#424245", anchor=tk.W).pack(fill="x")
+
+    # ── 导航 ──
+    def go(self):
+        url = self.url_entry.get().strip()
+        if not url:
+            return
+        if not url.startswith("http"):
+            url = "http://" + url
+        self.load_url(url)
+
+    def go_up(self):
+        if not self.current_url:
+            return
+        parent = self.current_url.rstrip("/")
+        parent = parent.rsplit("/", 1)[0] + "/"
+        self.url_entry.delete(0, tk.END)
+        self.url_entry.insert(0, parent)
+        self.load_url(parent)
+
+    def load_url(self, url):
+        self.dl_status_var.set(f"正在加载 {url} ...")
+        self.tree.delete(*self.tree.get_children())
+
+        def _work():
+            try:
+                items = fetch_file_list(url)
+                self.current_url = url if url.endswith("/") else url + "/"
+                self.root.after(0, lambda: self._populate(items))
+            except Exception as e:
+                self.root.after(0, lambda: self.dl_status_var.set(f"加载失败: {e}"))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _populate(self, items):
+        self.tree.delete(*self.tree.get_children())
+        for name, is_dir, size_str, modified in items:
+            type_str = "📁 目录" if is_dir else "📄 文件"
+            self.tree.insert("", tk.END, values=(name, type_str, size_str, modified),
+                             tags=("dir" if is_dir else "file",))
+        self.dl_status_var.set(f"已加载 {len(items)} 个项目")
+        self.url_entry.delete(0, tk.END)
+        self.url_entry.insert(0, self.current_url)
+
+    def on_double_click(self, event):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        item = self.tree.item(sel[0])
+        name = item["values"][0]
+        tags = item["tags"]
+        if "dir" in tags:
+            new_url = self.current_url + urllib.parse.quote(str(name)) + "/"
+            self.url_entry.delete(0, tk.END)
+            self.url_entry.insert(0, new_url)
+            self.load_url(new_url)
+        else:
+            # 双击文件：如果是文本文件就预览，否则下载
+            ext = os.path.splitext(str(name))[1].lower()
+            if ext in TEXT_EXTENSIONS:
+                self.preview_file(str(name))
+            else:
+                self.download_selected()
+
+    # ── 下载 ──
+    def choose_save_dir(self):
+        d = filedialog.askdirectory()
+        if d:
+            self.download_dir = d
+            self.save_label.config(text=d, fg="black")
+
+    def download_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先选择要下载的项目")
+            return
+        if not self.download_dir:
+            self.choose_save_dir()
+            if not self.download_dir:
+                return
+
+        item = self.tree.item(sel[0])
+        name = str(item["values"][0])
+        is_dir = "dir" in item["tags"]
+        file_url = self.current_url + urllib.parse.quote(name) + ("/" if is_dir else "")
+        dest = os.path.join(self.download_dir, name)
+
+        self.dl_status_var.set(f"正在下载: {name} ...")
+
+        def _work():
+            try:
+                if is_dir:
+                    download_directory(file_url, dest)
+                else:
+                    download_file(file_url, dest)
+                self.root.after(0, lambda: self.dl_status_var.set(f"✅ 下载完成: {dest}"))
+                self.root.after(0, lambda: messagebox.showinfo("完成", f"已下载到:\n{dest}"))
+            except Exception as e:
+                self.root.after(0, lambda: self.dl_status_var.set(f"❌ 下载失败: {e}"))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    # ── 预览 ──
+    def show_context_menu(self, event):
+        try:
+            self.tree.selection_set(self.tree.identify_row(event.y))
+            self.ctx_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.ctx_menu.grab_release()
+
+    def preview_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先选择要预览的文件")
+            return
+        item = self.tree.item(sel[0])
+        name = str(item["values"][0])
+        if "dir" in item["tags"]:
+            messagebox.showinfo("提示", "目录不支持预览，请双击进入")
+            return
+        self.preview_file(name)
+
+    def preview_file(self, name):
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in TEXT_EXTENSIONS:
+            messagebox.showinfo("提示", f"该文件类型 ({ext}) 不支持文本预览，请下载后查看")
+            return
+
+        file_url = self.current_url + urllib.parse.quote(name)
+        self.dl_status_var.set(f"正在获取: {name} ...")
+
+        def _work():
+            try:
+                content = fetch_text_content(file_url)
+                self.root.after(0, lambda: self._show_preview_window(name, content))
+                self.root.after(0, lambda: self.dl_status_var.set("就绪"))
+            except Exception as e:
+                self.root.after(0, lambda: self.dl_status_var.set(f"预览失败: {e}"))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _show_preview_window(self, title, content):
+        win = tk.Toplevel(self.root)
+        win.title(f"预览 - {title}")
+        win.geometry("700x500")
+        text_area = scrolledtext.ScrolledText(win, font=("Consolas", 10), wrap=tk.WORD)
+        text_area.pack(fill="both", expand=True)
+        text_area.insert("1.0", content)
+        text_area.config(state=tk.DISABLED)
+
+
+# ─── 主应用 ─────────────────────────────────────────────────
+class HttpShareApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("🚀 极简秒传 - 局域网分享 & 下载")
+        self.root.geometry("680x780")
+        self.root.minsize(620, 700)
+        self.root.configure(bg="#f5f5f7")
+
+        try:
+            from ctypes import windll
+            windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+
+        self.style = ttk.Style()
+        self.style.theme_use("clam")
+        self.style.configure("TButton", font=("Microsoft YaHei", 10), padding=8)
+        self.style.configure("TNotebook.Tab", font=("Microsoft YaHei", 11), padding=[15, 6])
+
+        # 状态栏（放在最底部）
+        self.status_var = tk.StringVar(value="准备就绪")
+        status_bar = tk.Label(root, textvariable=self.status_var, bd=0, bg="#e8e8ed",
+                              fg="#424245", font=("Microsoft YaHei", 8), anchor=tk.W, padx=10, pady=4)
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Tab 容器
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(expand=True, fill="both", padx=10, pady=(10, 0))
+
+        share_frame = tk.Frame(self.notebook, bg="#f5f5f7")
+        download_frame = tk.Frame(self.notebook, bg="#f5f5f7")
+
+        self.notebook.add(share_frame, text="  📤 分享  ")
+        self.notebook.add(download_frame, text="  📥 下载  ")
+
+        self.share_tab = ShareTab(share_frame, root)
+        self.download_tab = DownloadTab(download_frame, root)
+
 
 if __name__ == "__main__":
     root = tk.Tk()
