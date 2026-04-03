@@ -26,6 +26,11 @@ from main import (
     download_directory,
     fetch_text_content,
     TEXT_EXTENSIONS,
+    url_to_unc_path,
+    is_smb_or_file_url,
+    list_unc_directory,
+    copy_unc_file,
+    copy_unc_directory,
 )
 
 
@@ -240,6 +245,147 @@ class TestFetchTextContent(IntegrationTestBase):
         content = fetch_text_content(url, max_bytes=100)
         # 虽然是 2048 字节，但只读 100 字节
         self.assertTrue(len(content.encode("utf-8", errors="replace")) <= 200)  # 替换字符可能变大，但应远小于 2048
+
+
+# ─── UNC / file:// 路径工具函数测试 ────────────────────────
+class TestUrlToUncPath(unittest.TestCase):
+    """测试 file:// URL 转 UNC 路径"""
+
+    def test_file_url_basic(self):
+        result = url_to_unc_path("file://192.168.1.5/share/docs")
+        self.assertEqual(result, "\\\\192.168.1.5\\share\\docs")
+
+    def test_file_url_with_encoded_chinese(self):
+        url = "file://192.168.1.5/%E6%96%87%E4%BB%B6"
+        result = url_to_unc_path(url)
+        self.assertEqual(result, "\\\\192.168.1.5\\文件")
+
+    def test_unc_passthrough(self):
+        result = url_to_unc_path("\\\\192.168.1.5\\share")
+        self.assertEqual(result, "\\\\192.168.1.5\\share")
+
+    def test_http_returns_none(self):
+        result = url_to_unc_path("http://example.com")
+        self.assertIsNone(result)
+
+    def test_strips_whitespace(self):
+        result = url_to_unc_path("  file://server/path  ")
+        self.assertEqual(result, "\\\\server\\path")
+
+
+class TestIsSmbOrFileUrl(unittest.TestCase):
+    """测试 SMB / file 路径判断"""
+
+    def test_file_url(self):
+        self.assertTrue(is_smb_or_file_url("file://192.168.1.5/share"))
+
+    def test_unc_path(self):
+        self.assertTrue(is_smb_or_file_url("\\\\192.168.1.5\\share"))
+
+    def test_http_url(self):
+        self.assertFalse(is_smb_or_file_url("http://example.com"))
+
+    def test_plain_path(self):
+        self.assertFalse(is_smb_or_file_url("C:\\Users\\test"))
+
+
+class TestListUncDirectory(unittest.TestCase):
+    """测试本地/UNC 目录列表读取"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.test_dir = tempfile.mkdtemp(prefix="unc_test_")
+        with open(os.path.join(cls.test_dir, "alpha.txt"), "w", encoding="utf-8") as f:
+            f.write("Alpha content")
+        with open(os.path.join(cls.test_dir, "中文.txt"), "w", encoding="utf-8") as f:
+            f.write("中文内容")
+        os.makedirs(os.path.join(cls.test_dir, "subdir"))
+        with open(os.path.join(cls.test_dir, "subdir", "inner.txt"), "w") as f:
+            f.write("inner")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.test_dir, ignore_errors=True)
+
+    def test_list_root(self):
+        items = list_unc_directory(self.test_dir)
+        names = [n for n, *_ in items]
+        self.assertIn("alpha.txt", names)
+        self.assertIn("中文.txt", names)
+        self.assertIn("subdir", names)
+
+    def test_directory_flag(self):
+        items = list_unc_directory(self.test_dir)
+        for name, is_dir, _, _ in items:
+            if name == "subdir":
+                self.assertTrue(is_dir)
+            elif name == "alpha.txt":
+                self.assertFalse(is_dir)
+
+    def test_size_and_time(self):
+        items = list_unc_directory(self.test_dir)
+        for name, is_dir, size_str, modified_str in items:
+            if name == "alpha.txt":
+                self.assertNotEqual(size_str, "-")
+                self.assertNotEqual(modified_str, "-")
+
+    def test_nonexistent_path(self):
+        with self.assertRaises(FileNotFoundError):
+            list_unc_directory(os.path.join(self.test_dir, "nonexistent"))
+
+
+class TestCopyUncFile(unittest.TestCase):
+    """测试 UNC 文件复制"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.test_dir = tempfile.mkdtemp(prefix="unc_copy_test_")
+        cls.src_file = os.path.join(cls.test_dir, "source.txt")
+        with open(cls.src_file, "w", encoding="utf-8") as f:
+            f.write("Hello UNC copy! 你好!")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.test_dir, ignore_errors=True)
+
+    def test_copy_file(self):
+        dest = os.path.join(self.test_dir, "copied.txt")
+        copy_unc_file(self.src_file, dest)
+        self.assertTrue(os.path.exists(dest))
+        with open(dest, "r", encoding="utf-8") as f:
+            self.assertIn("Hello UNC copy!", f.read())
+
+    def test_copy_with_progress(self):
+        dest = os.path.join(self.test_dir, "copied_cb.txt")
+        calls = []
+        copy_unc_file(self.src_file, dest, progress_callback=lambda d, t: calls.append((d, t)))
+        self.assertTrue(len(calls) > 0)
+
+
+class TestCopyUncDirectory(unittest.TestCase):
+    """测试 UNC 目录递归复制"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.test_dir = tempfile.mkdtemp(prefix="unc_dir_test_")
+        cls.src_dir = os.path.join(cls.test_dir, "src")
+        os.makedirs(os.path.join(cls.src_dir, "inner"))
+        with open(os.path.join(cls.src_dir, "top.txt"), "w") as f:
+            f.write("top level")
+        with open(os.path.join(cls.src_dir, "inner", "deep.txt"), "w") as f:
+            f.write("deep level")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.test_dir, ignore_errors=True)
+
+    def test_copy_directory(self):
+        dest_dir = os.path.join(self.test_dir, "dst")
+        copy_unc_directory(self.src_dir, dest_dir)
+        self.assertTrue(os.path.exists(os.path.join(dest_dir, "top.txt")))
+        self.assertTrue(os.path.exists(os.path.join(dest_dir, "inner", "deep.txt")))
+        with open(os.path.join(dest_dir, "inner", "deep.txt"), "r") as f:
+            self.assertEqual(f.read(), "deep level")
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ import re
 import shutil
 from datetime import datetime
 from html.parser import HTMLParser
+from version import get_version
 
 
 # ─── 工具函数 ───────────────────────────────────────────────
@@ -35,6 +36,86 @@ def format_size(size_bytes):
             return f"{size_bytes:.1f} {unit}"
         size_bytes /= 1024
     return f"{size_bytes:.1f} PB"
+
+
+def url_to_unc_path(url):
+    """将 file:// URL 或 SMB 路径转为 Windows UNC 路径
+    例如: file://192.168.1.5/share/docs  -> \\\\192.168.1.5\\share\\docs
+          \\\\192.168.1.5\\share          -> 原样返回
+    """
+    url = url.strip()
+    if url.startswith("file://"):
+        # file://host/path -> \\host\path
+        path = url[len("file://"):]
+        path = urllib.parse.unquote(path)
+        path = path.replace("/", "\\")
+        if not path.startswith("\\\\"):
+            path = "\\\\" + path
+        return path
+    if url.startswith("\\\\"):
+        return url
+    return None  # 不是 file/UNC 路径
+
+
+def is_smb_or_file_url(url):
+    """判断是否是 file:// 或 UNC(\\\\) 路径"""
+    url = url.strip()
+    return url.startswith("file://") or url.startswith("\\\\")
+
+
+def list_unc_directory(unc_path):
+    """列出 UNC/本地目录的文件，返回 [(name, is_dir, size_str, modified_str), ...]"""
+    items = []
+    try:
+        entries = os.listdir(unc_path)
+    except PermissionError:
+        raise PermissionError(f"无权限访问: {unc_path}")
+    except FileNotFoundError:
+        raise FileNotFoundError(f"路径不存在: {unc_path}")
+
+    for entry in sorted(entries, key=lambda x: (not os.path.isdir(os.path.join(unc_path, x)), x.lower())):
+        full_path = os.path.join(unc_path, entry)
+        is_dir = os.path.isdir(full_path)
+        size_str = "-"
+        modified_str = "-"
+        try:
+            stat = os.stat(full_path)
+            if not is_dir:
+                size_str = format_size(stat.st_size)
+            modified_str = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+        items.append((entry, is_dir, size_str, modified_str))
+    return items
+
+
+def copy_unc_file(src_path, dest_path, progress_callback=None):
+    """从 UNC 路径复制文件到本地"""
+    total = os.path.getsize(src_path)
+    copied = 0
+    with open(src_path, "rb") as src, open(dest_path, "wb") as dst:
+        while True:
+            chunk = src.read(8192)
+            if not chunk:
+                break
+            dst.write(chunk)
+            copied += len(chunk)
+            if progress_callback and total:
+                progress_callback(copied, total)
+
+
+def copy_unc_directory(src_dir, dest_dir, progress_callback=None):
+    """递归复制 UNC 目录到本地"""
+    os.makedirs(dest_dir, exist_ok=True)
+    for entry in os.listdir(src_dir):
+        src_path = os.path.join(src_dir, entry)
+        dst_path = os.path.join(dest_dir, entry)
+        if os.path.isdir(src_path):
+            copy_unc_directory(src_path, dst_path, progress_callback)
+        else:
+            copy_unc_file(src_path, dst_path, progress_callback)
+            if progress_callback:
+                progress_callback(-1, -1)
 
 
 # ─── HTTP 目录列表解析器 ─────────────────────────────────────
@@ -343,11 +424,12 @@ TEXT_EXTENSIONS = {
 
 
 class DownloadTab:
-    """新增的"下载文件"功能 Tab"""
+    """新增的"下载文件"功能 Tab，支持 HTTP 和 file:// / UNC 路径"""
 
     def __init__(self, parent_frame, root):
         self.root = root
-        self.current_url = ""          # 当前正在浏览的 URL
+        self.current_url = ""          # 当前正在浏览的 URL / UNC 路径
+        self.is_unc = False            # 当前是否为 UNC/file 模式
         self.history = []              # URL 导航历史
         self.download_dir = ""         # 下载保存目录
         self.setup_ui(parent_frame)
@@ -368,8 +450,9 @@ class DownloadTab:
         tk.Label(addr_frame, text="地址:", font=("Microsoft YaHei", 10), bg="#f5f5f7").pack(side=tk.LEFT)
         self.url_entry = ttk.Entry(addr_frame, font=("Consolas", 10))
         self.url_entry.pack(side=tk.LEFT, fill="x", expand=True, padx=5, ipady=4)
-        self.url_entry.insert(0, "http://192.168.1.5:8080/")
+        self.url_entry.insert(0, "http://192.168.1.5:8080/ 或 \\\\192.168.1.5\\share")
         self.url_entry.bind("<Return>", lambda e: self.go())
+        self.url_entry.bind("<FocusIn>", self._clear_placeholder)
         ttk.Button(addr_frame, text="访问", command=self.go, width=6).pack(side=tk.LEFT, padx=2)
         ttk.Button(addr_frame, text="⬆ 上级", command=self.go_up, width=6).pack(side=tk.LEFT, padx=2)
 
@@ -414,23 +497,45 @@ class DownloadTab:
                  bg="#f5f5f7", fg="#424245", anchor=tk.W).pack(fill="x")
 
     # ── 导航 ──
+    def _clear_placeholder(self, event=None):
+        """清除地址栏占位提示"""
+        text = self.url_entry.get()
+        if "或" in text:
+            self.url_entry.delete(0, tk.END)
+
     def go(self):
         url = self.url_entry.get().strip()
-        if not url:
+        if not url or "或" in url:
             return
-        if not url.startswith("http"):
-            url = "http://" + url
-        self.load_url(url)
+
+        if is_smb_or_file_url(url):
+            # file:// 或 UNC 路径
+            unc_path = url_to_unc_path(url) if url.startswith("file://") else url
+            self.is_unc = True
+            self.load_unc(unc_path)
+        else:
+            self.is_unc = False
+            if not url.startswith("http"):
+                url = "http://" + url
+            self.load_url(url)
 
     def go_up(self):
         if not self.current_url:
             return
-        parent = self.current_url.rstrip("/")
-        parent = parent.rsplit("/", 1)[0] + "/"
-        self.url_entry.delete(0, tk.END)
-        self.url_entry.insert(0, parent)
-        self.load_url(parent)
+        if self.is_unc:
+            parent = os.path.dirname(self.current_url.rstrip("\\"))
+            if parent and parent != self.current_url:
+                self.url_entry.delete(0, tk.END)
+                self.url_entry.insert(0, parent)
+                self.load_unc(parent)
+        else:
+            parent = self.current_url.rstrip("/")
+            parent = parent.rsplit("/", 1)[0] + "/"
+            self.url_entry.delete(0, tk.END)
+            self.url_entry.insert(0, parent)
+            self.load_url(parent)
 
+    # ── HTTP 模式 ──
     def load_url(self, url):
         self.dl_status_var.set(f"正在加载 {url} ...")
         self.tree.delete(*self.tree.get_children())
@@ -439,6 +544,23 @@ class DownloadTab:
             try:
                 items = fetch_file_list(url)
                 self.current_url = url if url.endswith("/") else url + "/"
+                self.is_unc = False
+                self.root.after(0, lambda: self._populate(items))
+            except Exception as e:
+                self.root.after(0, lambda: self.dl_status_var.set(f"加载失败: {e}"))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    # ── UNC / file:// 模式 ──
+    def load_unc(self, unc_path):
+        self.dl_status_var.set(f"正在加载 {unc_path} ...")
+        self.tree.delete(*self.tree.get_children())
+
+        def _work():
+            try:
+                items = list_unc_directory(unc_path)
+                self.current_url = unc_path
+                self.is_unc = True
                 self.root.after(0, lambda: self._populate(items))
             except Exception as e:
                 self.root.after(0, lambda: self.dl_status_var.set(f"加载失败: {e}"))
@@ -460,18 +582,24 @@ class DownloadTab:
         if not sel:
             return
         item = self.tree.item(sel[0])
-        name = item["values"][0]
+        name = str(item["values"][0])
         tags = item["tags"]
         if "dir" in tags:
-            new_url = self.current_url + urllib.parse.quote(str(name)) + "/"
-            self.url_entry.delete(0, tk.END)
-            self.url_entry.insert(0, new_url)
-            self.load_url(new_url)
+            if self.is_unc:
+                new_path = os.path.join(self.current_url, name)
+                self.url_entry.delete(0, tk.END)
+                self.url_entry.insert(0, new_path)
+                self.load_unc(new_path)
+            else:
+                new_url = self.current_url + urllib.parse.quote(name) + "/"
+                self.url_entry.delete(0, tk.END)
+                self.url_entry.insert(0, new_url)
+                self.load_url(new_url)
         else:
             # 双击文件：如果是文本文件就预览，否则下载
-            ext = os.path.splitext(str(name))[1].lower()
+            ext = os.path.splitext(name)[1].lower()
             if ext in TEXT_EXTENSIONS:
-                self.preview_file(str(name))
+                self.preview_file(name)
             else:
                 self.download_selected()
 
@@ -495,17 +623,25 @@ class DownloadTab:
         item = self.tree.item(sel[0])
         name = str(item["values"][0])
         is_dir = "dir" in item["tags"]
-        file_url = self.current_url + urllib.parse.quote(name) + ("/" if is_dir else "")
         dest = os.path.join(self.download_dir, name)
 
         self.dl_status_var.set(f"正在下载: {name} ...")
 
         def _work():
             try:
-                if is_dir:
-                    download_directory(file_url, dest)
+                if self.is_unc:
+                    src = os.path.join(self.current_url, name)
+                    if is_dir:
+                        copy_unc_directory(src, dest)
+                    else:
+                        os.makedirs(os.path.dirname(dest), exist_ok=True)
+                        copy_unc_file(src, dest)
                 else:
-                    download_file(file_url, dest)
+                    file_url = self.current_url + urllib.parse.quote(name) + ("/" if is_dir else "")
+                    if is_dir:
+                        download_directory(file_url, dest)
+                    else:
+                        download_file(file_url, dest)
                 self.root.after(0, lambda: self.dl_status_var.set(f"✅ 下载完成: {dest}"))
                 self.root.after(0, lambda: messagebox.showinfo("完成", f"已下载到:\n{dest}"))
             except Exception as e:
@@ -539,12 +675,17 @@ class DownloadTab:
             messagebox.showinfo("提示", f"该文件类型 ({ext}) 不支持文本预览，请下载后查看")
             return
 
-        file_url = self.current_url + urllib.parse.quote(name)
         self.dl_status_var.set(f"正在获取: {name} ...")
 
         def _work():
             try:
-                content = fetch_text_content(file_url)
+                if self.is_unc:
+                    full_path = os.path.join(self.current_url, name)
+                    with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read(512 * 1024)
+                else:
+                    file_url = self.current_url + urllib.parse.quote(name)
+                    content = fetch_text_content(file_url)
                 self.root.after(0, lambda: self._show_preview_window(name, content))
                 self.root.after(0, lambda: self.dl_status_var.set("就绪"))
             except Exception as e:
@@ -566,7 +707,8 @@ class DownloadTab:
 class HttpShareApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("🚀 极简秒传 - 局域网分享 & 下载")
+        self.version = get_version()
+        self.root.title(f"🚀 极简秒传 v{self.version} - 局域网分享 & 下载")
         self.root.geometry("680x780")
         self.root.minsize(620, 700)
         self.root.configure(bg="#f5f5f7")
@@ -580,10 +722,16 @@ class HttpShareApp:
         self.style = ttk.Style()
         self.style.theme_use("clam")
         self.style.configure("TButton", font=("Microsoft YaHei", 10), padding=8)
-        self.style.configure("TNotebook.Tab", font=("Microsoft YaHei", 11), padding=[15, 6])
+        self.style.configure("TNotebook", background="#f5f5f7", borderwidth=0)
+        self.style.configure("TNotebook.Tab", font=("Microsoft YaHei", 11), padding=[20, 8],
+                             background="#d2d2d7", foreground="#424245")
+        self.style.map("TNotebook.Tab",
+                       background=[("selected", "#ffffff")],
+                       foreground=[("selected", "#1d1d1f")],
+                       expand=[("selected", [0, 2, 0, 0])])  # 选中的 Tab 向上扩展 2px，视觉前置
 
         # 状态栏（放在最底部）
-        self.status_var = tk.StringVar(value="准备就绪")
+        self.status_var = tk.StringVar(value=f"v{self.version} | 准备就绪")
         status_bar = tk.Label(root, textvariable=self.status_var, bd=0, bg="#e8e8ed",
                               fg="#424245", font=("Microsoft YaHei", 8), anchor=tk.W, padx=10, pady=4)
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
