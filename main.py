@@ -27,6 +27,24 @@ def get_local_ip():
         return "127.0.0.1"
 
 
+def get_all_interfaces():
+    """获取所有可用的网络接口和对应 IPv4 地址，返回 [(显示文本, ip), ...]"""
+    interfaces = []
+    try:
+        import psutil
+        for name, addrs in psutil.net_if_addrs().items():
+            for addr in addrs:
+                if addr.family == socket.AF_INET and not addr.address.startswith("127."):
+                    interfaces.append((f"{name}  ({addr.address})", addr.address))
+    except ImportError:
+        pass
+    # 兜底：至少保留默认路由 IP
+    if not interfaces:
+        ip = get_local_ip()
+        interfaces.append((f"默认  ({ip})", ip))
+    return interfaces
+
+
 def format_size(size_bytes):
     """把字节数格式化为人类可读的大小"""
     if size_bytes is None or size_bytes < 0:
@@ -248,6 +266,13 @@ class ShareTab:
         self.port = 8080
         self.whitelist = set()
         self.whitelist_enabled = tk.BooleanVar(value=False)
+        self.settings_visible = False
+        self.selected_ip = tk.StringVar()
+
+        # 获取网卡列表
+        self.interfaces = get_all_interfaces()
+        if self.interfaces:
+            self.selected_ip.set(self.interfaces[0][0])
 
         self.setup_ui(parent_frame)
 
@@ -275,15 +300,43 @@ class ShareTab:
                                    font=("Microsoft YaHei", 9), bg="#ffffff", fg="#6e6e73", wraplength=480)
         self.path_label.pack()
 
-        # 白名单
-        wl_frame = tk.Frame(main_frame, bg="#f5f5f7")
-        wl_frame.pack(fill="x", pady=5)
-        ttk.Checkbutton(wl_frame, text="开启白名单 (仅允许指定IP)",
+        # ⚙ 设置按钮（可折叠）
+        self.toggle_btn = tk.Label(main_frame, text="⚙ 展开设置", font=("Microsoft YaHei", 9),
+                                   bg="#f5f5f7", fg="#007aff", cursor="hand2")
+        self.toggle_btn.pack(anchor=tk.W, pady=(5, 0))
+        self.toggle_btn.bind("<Button-1>", lambda e: self.toggle_settings())
+
+        # 设置面板 (默认隐藏)
+        self.settings_frame = tk.Frame(main_frame, bg="#eeeef0", highlightthickness=1,
+                                       highlightbackground="#d2d2d7", padx=12, pady=10)
+        # 不 pack, 初始隐藏
+
+        # 设置项 - 网卡选择
+        nic_frame = tk.Frame(self.settings_frame, bg="#eeeef0")
+        nic_frame.pack(fill="x", pady=3)
+        tk.Label(nic_frame, text="🌐 网卡:", font=("Microsoft YaHei", 9), bg="#eeeef0").pack(side=tk.LEFT)
+        nic_values = [item[0] for item in self.interfaces]
+        self.nic_combo = ttk.Combobox(nic_frame, textvariable=self.selected_ip,
+                                      values=nic_values, state="readonly", width=35)
+        self.nic_combo.pack(side=tk.LEFT, padx=8)
+        self.nic_combo.bind("<<ComboboxSelected>>", lambda e: self._on_nic_change())
+
+        # 设置项 - 白名单
+        wl_frame = tk.Frame(self.settings_frame, bg="#eeeef0")
+        wl_frame.pack(fill="x", pady=3)
+        ttk.Checkbutton(wl_frame, text="🔒 开启白名单 (仅允许指定IP)",
                         variable=self.whitelist_enabled, command=self.on_whitelist_toggle).pack(side=tk.LEFT)
-        self.ip_entry = ttk.Entry(wl_frame, width=15)
-        self.ip_entry.pack(side=tk.LEFT, padx=(15, 5))
+
+        wl_input_frame = tk.Frame(self.settings_frame, bg="#eeeef0")
+        wl_input_frame.pack(fill="x", pady=3)
+        tk.Label(wl_input_frame, text="      允许IP:", font=("Microsoft YaHei", 9), bg="#eeeef0").pack(side=tk.LEFT)
+        self.ip_entry = ttk.Entry(wl_input_frame, width=15)
+        self.ip_entry.pack(side=tk.LEFT, padx=5)
         self.ip_entry.insert(0, "192.168.1.100")
-        ttk.Button(wl_frame, text="添加", command=self.add_to_whitelist, width=6).pack(side=tk.LEFT)
+        ttk.Button(wl_input_frame, text="添加", command=self.add_to_whitelist, width=6).pack(side=tk.LEFT, padx=3)
+        self.wl_list_label = tk.Label(wl_input_frame, text="", font=("Microsoft YaHei", 8),
+                                      bg="#eeeef0", fg="#86868b")
+        self.wl_list_label.pack(side=tk.LEFT, padx=8)
 
         # 链接
         tk.Label(main_frame, text="共享链接:", font=("Microsoft YaHei", 10, "bold"),
@@ -307,6 +360,32 @@ class ShareTab:
                                                   highlightbackground="#d2d2d7")
         self.log_area.pack(fill="both", expand=True)
         self.log_area.config(state=tk.DISABLED)
+
+    # ── 设置面板折叠 ──
+    def toggle_settings(self):
+        if self.settings_visible:
+            self.settings_frame.pack_forget()
+            self.toggle_btn.config(text="⚙ 展开设置")
+            self.settings_visible = False
+        else:
+            # 插到 toggle_btn 下方
+            self.settings_frame.pack(after=self.toggle_btn, fill="x", pady=(3, 8))
+            self.toggle_btn.config(text="⚙ 收起设置")
+            self.settings_visible = True
+
+    def _on_nic_change(self):
+        """网卡切换后，如果正在分享则重新生成链接"""
+        if self.share_path:
+            self._update_share_url()
+            self.log(f"网卡已切换 → {self._get_selected_ip()}")
+
+    def _get_selected_ip(self):
+        """从下拉框获取当前选中的 IP"""
+        display = self.selected_ip.get()
+        for text, ip in self.interfaces:
+            if text == display:
+                return ip
+        return get_local_ip()
 
     # ── 业务逻辑 ──
     def select_file(self):
@@ -337,6 +416,7 @@ class ShareTab:
             self.whitelist.add(ip)
             self.log(f"系统消息: 已添加 {ip} 到白名单")
             self.ip_entry.delete(0, tk.END)
+            self.wl_list_label.config(text=f"已添加: {', '.join(self.whitelist)}")
         else:
             messagebox.showwarning("提示", "请输入有效的 IP 地址")
 
@@ -352,12 +432,22 @@ class ShareTab:
 
         self.root.after(0, _update)
 
+    def _update_share_url(self):
+        """根据当前选中的网卡更新链接"""
+        local_ip = self._get_selected_ip()
+        if self.is_dir:
+            share_url = f"http://{local_ip}:{self.port}/"
+        else:
+            share_url = f"http://{local_ip}:{self.port}/{urllib.parse.quote(os.path.basename(self.share_path))}"
+        self.link_text.delete(0, tk.END)
+        self.link_text.insert(0, share_url)
+
     def start_server(self):
         if self.httpd:
             self.httpd.shutdown()
             self.httpd.server_close()
 
-        local_ip = get_local_ip()
+        local_ip = self._get_selected_ip()
         if self.is_dir:
             share_url = f"http://{local_ip}:{self.port}/"
             dir_to_serve = self.share_path
@@ -722,13 +812,16 @@ class HttpShareApp:
         self.style = ttk.Style()
         self.style.theme_use("clam")
         self.style.configure("TButton", font=("Microsoft YaHei", 10), padding=8)
-        self.style.configure("TNotebook", background="#f5f5f7", borderwidth=0)
-        self.style.configure("TNotebook.Tab", font=("Microsoft YaHei", 11), padding=[20, 8],
-                             background="#d2d2d7", foreground="#424245")
+
+        # Tab 美化：选中白底突出，未选中灰底后退
+        self.style.configure("TNotebook", background="#f5f5f7", borderwidth=0, tabmargins=[8, 5, 8, 0])
+        self.style.configure("TNotebook.Tab", font=("Microsoft YaHei", 11, "bold"), padding=[24, 10],
+                             background="#d2d2d7", foreground="#6e6e73", borderwidth=0)
         self.style.map("TNotebook.Tab",
-                       background=[("selected", "#ffffff")],
-                       foreground=[("selected", "#1d1d1f")],
-                       expand=[("selected", [0, 2, 0, 0])])  # 选中的 Tab 向上扩展 2px，视觉前置
+                       background=[("selected", "#ffffff"), ("!selected", "#d2d2d7")],
+                       foreground=[("selected", "#007aff"), ("!selected", "#6e6e73")],
+                       expand=[("selected", [0, 3, 0, 0])],  # 选中 Tab 向上凸出 3px
+                       padding=[("selected", [24, 12])])
 
         # 状态栏（放在最底部）
         self.status_var = tk.StringVar(value=f"v{self.version} | 准备就绪")

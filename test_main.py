@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from main import (
     get_local_ip,
+    get_all_interfaces,
     format_size,
     DirectoryListParser,
     fetch_file_list,
@@ -67,6 +68,28 @@ class TestGetLocalIp(unittest.TestCase):
         self.assertEqual(len(parts), 4)
         for p in parts:
             self.assertTrue(0 <= int(p) <= 255)
+
+
+class TestGetAllInterfaces(unittest.TestCase):
+    """测试获取所有网络接口"""
+
+    def test_returns_list(self):
+        interfaces = get_all_interfaces()
+        self.assertIsInstance(interfaces, list)
+        self.assertTrue(len(interfaces) > 0)
+
+    def test_tuple_format(self):
+        interfaces = get_all_interfaces()
+        for display_text, ip in interfaces:
+            self.assertIsInstance(display_text, str)
+            self.assertIsInstance(ip, str)
+            # IP 不应以 127 开头
+            self.assertFalse(ip.startswith("127."))
+
+    def test_display_text_contains_ip(self):
+        interfaces = get_all_interfaces()
+        for display_text, ip in interfaces:
+            self.assertIn(ip, display_text)
 
 
 class TestDirectoryListParser(unittest.TestCase):
