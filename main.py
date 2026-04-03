@@ -27,8 +27,23 @@ def get_local_ip():
         return "127.0.0.1"
 
 
+def _detect_best_ip():
+    """检测能联通默认网关的本机 IP（通过 UDP connect 到公网地址）"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(1)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return None
+
+
 def get_all_interfaces():
-    """获取所有可用的网络接口和对应 IPv4 地址，返回 [(显示文本, ip), ...]"""
+    """获取所有可用的网络接口和对应 IPv4 地址，返回 [(显示文本, ip), ...]
+    自动把能联通路由/网关的网卡排在最前面，便于用户零操作即开始分享。
+    """
     interfaces = []
     try:
         import psutil
@@ -42,6 +57,12 @@ def get_all_interfaces():
     if not interfaces:
         ip = get_local_ip()
         interfaces.append((f"默认  ({ip})", ip))
+        return interfaces
+
+    # 把能连通网关的网卡排到最前
+    best_ip = _detect_best_ip()
+    if best_ip:
+        interfaces.sort(key=lambda item: (0 if item[1] == best_ip else 1))
     return interfaces
 
 

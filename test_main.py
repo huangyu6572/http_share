@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from main import (
     get_local_ip,
     get_all_interfaces,
+    _detect_best_ip,
     format_size,
     DirectoryListParser,
     fetch_file_list,
@@ -90,6 +91,39 @@ class TestGetAllInterfaces(unittest.TestCase):
         interfaces = get_all_interfaces()
         for display_text, ip in interfaces:
             self.assertIn(ip, display_text)
+
+    def test_best_ip_is_first(self):
+        """能联通网关的网卡应排在第一位"""
+        best = _detect_best_ip()
+        if best is None:
+            self.skipTest("当前无法检测默认路由 IP，跳过排序测试")
+        interfaces = get_all_interfaces()
+        # 只要列表中包含 best_ip，它就应该排第一
+        ips = [ip for _, ip in interfaces]
+        if best in ips:
+            self.assertEqual(interfaces[0][1], best,
+                             f"期望第一个网卡 IP 为 {best}，实际为 {interfaces[0][1]}")
+
+
+class TestDetectBestIp(unittest.TestCase):
+    """测试检测最佳网卡 IP"""
+
+    def test_returns_string_or_none(self):
+        result = _detect_best_ip()
+        self.assertTrue(result is None or isinstance(result, str))
+
+    def test_valid_ipv4_format(self):
+        result = _detect_best_ip()
+        if result is not None:
+            parts = result.split(".")
+            self.assertEqual(len(parts), 4)
+            for p in parts:
+                self.assertTrue(0 <= int(p) <= 255)
+
+    def test_not_loopback(self):
+        result = _detect_best_ip()
+        if result is not None:
+            self.assertFalse(result.startswith("127."))
 
 
 class TestDirectoryListParser(unittest.TestCase):
