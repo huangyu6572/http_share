@@ -24,7 +24,5 @@ jobs:
           persist-credentials: false
 
       - uses: anomalyco/opencode/github@latest
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         with:
-          model: google/gemini-2.0-pro-flash
+          # 使用OpenCode内置免费Zen模型，无需API Key
