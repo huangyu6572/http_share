@@ -26,4 +26,3 @@ jobs:
       - uses: anomalyco/opencode/github@latest
         with:
           model: anthropic/claude-sonnet-4-20250514
-          github_token: ${{ secrets.GITHUB_TOKEN }}
