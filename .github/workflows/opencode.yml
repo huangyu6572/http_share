@@ -28,5 +28,5 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           use_github_token: true
-          model: github-copilot/claude-3.7-sonnet
+          model: github-copilot/gpt-4o
           share: false
