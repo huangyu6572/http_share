@@ -26,3 +26,4 @@ jobs:
       - uses: anomalyco/opencode/github@latest
         with:
           share: false
+          model: opencode/zen
