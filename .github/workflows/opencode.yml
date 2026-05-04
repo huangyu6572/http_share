@@ -25,4 +25,4 @@ jobs:
 
       - uses: anomalyco/opencode/github@latest
         with:
-          model: anthropic/claude-sonnet-4-20250514
+          model: github/anthropic-claude-sonnet-4-20250514
