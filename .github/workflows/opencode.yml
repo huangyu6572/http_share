@@ -29,3 +29,4 @@ jobs:
         with:
           use_github_token: true
           model: copilot/claude-3.7-sonnet
+          share: false
