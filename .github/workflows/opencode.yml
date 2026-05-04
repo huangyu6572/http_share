@@ -24,7 +24,8 @@ jobs:
           persist-credentials: false
 
       - uses: anomalyco/opencode/github@latest
+        env:
+          GITHUB_TOKEN: ${{ env.GITHUB_TOKEN }}
         with:
           model: github/anthropic-claude-sonnet-4-20250514
-          github_token: ${{ secrets.GITHUB_TOKEN }}
           use_github_token: true
