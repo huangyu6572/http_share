@@ -25,6 +25,12 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Configure git author
+        shell: bash
+        run: |
+          git config --global user.name "opencode-agent[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
       - name: Setup Copilot auth
         shell: bash
         env:
