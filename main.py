@@ -860,6 +860,11 @@ class HttpShareApp:
         self.notebook.add(share_frame, text="  📤 分享  ")
         self.notebook.add(download_frame, text="  📥 下载  ")
 
+        # 讲解说明 tab
+        explain_frame = tk.Frame(self.notebook, bg="#f5f5f7")
+        self.notebook.add(explain_frame, text="  📘 讲解说明  ")
+        tk.Label(explain_frame, text="欢迎使用应用！这里是讲解说明。", bg="#f5f5f7", font=("Microsoft YaHei", 10)).pack(pady=20)
+
         self.share_tab = ShareTab(share_frame, root)
         self.download_tab = DownloadTab(download_frame, root)
 
