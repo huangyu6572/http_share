@@ -10,7 +10,8 @@ jobs:
   opencode:
     if: |
       contains(github.event.comment.body, '/oc') ||
-      contains(github.event.comment.body, '/opencode')
+      contains(github.event.comment.body, '/opencode') ||
+      contains(github.event.comment.body, '/oc ')
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -25,4 +26,4 @@ jobs:
 
       - uses: anomalyco/opencode/github@latest
         with:
-          # 使用OpenCode内置免费Zen模型，无需API Key
+          model: opencode/zen
