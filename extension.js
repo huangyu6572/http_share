@@ -66,7 +66,9 @@ function activate(context) {
 
 function deactivate() {}
 
-function getWebviewContent(prompts) {
+function getWebviewContent(prompts, instructions = 'This is the instructions tab. Add your guidance here.') {
+  const instructionsTab = `<div class='instructions'>${escapeHtml(instructions)}</div>`;
+
   const list = prompts.map(p => `
     <div class="item">
       <button class="title" data-id="${p.id}">${escapeHtml(p.title)}</button>
@@ -87,13 +89,27 @@ function getWebviewContent(prompts) {
       .content{background:#f3f3f3;padding:8px;border-radius:4px}
       .controls{display:flex;gap:8px;margin-top:8px}
       textarea{width:100%;height:120px}
+      .tabs{display:flex;gap:4px;margin-bottom:10px}
+      .tabs button{padding:5px 10px;border:1px solid #ccc;cursor:pointer;}
+      .tabs button.active{background-color:#007acc;color:white;border-color:#007acc;}
       input[type=text]{width:100%}
     </style>
   </head>
   <body>
     <h2>Prompts</h2>
     <div id="list">
-      ${list}
+      <div class="tabs">
+        <button id="tabPrompts" class="active">Prompts</button>
+        <button id="tabInstructions">Instructions</button>
+      </div>
+      <div id="tabContent">
+        <div id="promptsTab">
+          ${list}
+        </div>
+        <div id="instructionsTab" style="display:none;">
+          ${instructionsTab}
+        </div>
+      </div>
     </div>
 
     <div class="controls">
@@ -112,6 +128,20 @@ function getWebviewContent(prompts) {
         vscode.postMessage({ command: 'add', title, content });
         document.getElementById('title').value = '';
         document.getElementById('content').value = '';
+      });
+
+      document.getElementById('tabPrompts').addEventListener('click', () => {
+        document.getElementById('promptsTab').style.display = '';
+        document.getElementById('instructionsTab').style.display = 'none';
+        document.getElementById('tabPrompts').classList.add('active');
+        document.getElementById('tabInstructions').classList.remove('active');
+      });
+
+      document.getElementById('tabInstructions').addEventListener('click', () => {
+        document.getElementById('promptsTab').style.display = 'none';
+        document.getElementById('instructionsTab').style.display = '';
+        document.getElementById('tabPrompts').classList.remove('active');
+        document.getElementById('tabInstructions').classList.add('active');
       });
 
       document.getElementById('list').addEventListener('click', (e) => {
